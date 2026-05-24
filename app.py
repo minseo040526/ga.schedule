@@ -6,7 +6,7 @@ import calendar
 import sqlite3
 import json
 import time
-from datetime import date, timedelta
+from datetime import date
 
 st.set_page_config(page_title="GA 월간 근무 스케줄", layout="wide")
 
@@ -66,18 +66,7 @@ def init_db():
                 close_hours REAL DEFAULT 8.0
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS substitute_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                store_name TEXT,
-                original_emp TEXT,
-                request_date TEXT,
-                shift TEXT,
-                status TEXT DEFAULT '대기중',
-                matched_emp TEXT DEFAULT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+
     # 기존 DB 마이그레이션
     with get_conn() as conn:
         for col, default in [
@@ -1024,95 +1013,3 @@ if st.button("GA로 월간 스케줄 생성", type="primary", use_container_widt
 
     st.dataframe(pd.DataFrame(salary_rows), use_container_width=True)
     st.metric("💼 이번 달 총 인건비 예상", f"{total_labor_cost:,} 원")
-
-
-# ─────────────────────────────────────────────
-# 8. 🔄 대타 매칭
-# ─────────────────────────────────────────────
-
-st.markdown("---")
-st.markdown('<div class="section-title">8. 🔄 대타 매칭</div>', unsafe_allow_html=True)
-st.markdown('<p style="color:#334155;font-size:14px;">결근 발생 시 조건에 맞는 대타 직원을 자동으로 추천합니다</p>', unsafe_allow_html=True)
-
-def save_sub_req(store, orig, req_date, shift):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO substitute_requests (store_name,original_emp,request_date,shift) VALUES (?,?,?,?)",
-            (store, orig, req_date.isoformat(), shift)
-        )
-
-def load_sub_reqs(store):
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM substitute_requests WHERE store_name=? ORDER BY created_at DESC", (store,)
-        ).fetchall()
-
-def match_sub(req_id, emp):
-    with get_conn() as conn:
-        conn.execute("UPDATE substitute_requests SET status='매칭완료',matched_emp=? WHERE id=?", (emp, req_id))
-
-def delete_sub(req_id):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM substitute_requests WHERE id=?", (req_id,))
-
-employee_names = [e["이름"] for e in employees]
-tab_req, tab_list = st.tabs(["대타 요청 등록", "요청 현황 및 매칭"])
-
-with tab_req:
-    col_a, col_b, col_c = st.columns(3)
-    with col_a: absent_emp = st.selectbox("결근 직원", employee_names, key="absent_emp")
-    with col_b: sub_date = st.date_input("결근 날짜", value=date(year, month, 1), key="sub_date")
-    with col_c: sub_shift = st.selectbox("결근 교대", SHIFTS, key="sub_shift")
-
-    if st.button("대타 후보 찾기"):
-        cands = []
-        for emp in employees:
-            if emp["이름"] == absent_emp: continue
-            if not is_available(emp, sub_date, sub_shift): continue
-            if "best_schedule" in st.session_state:
-                if any(emp["이름"] in st.session_state["best_schedule"].get(sub_date, {}).get(s, []) for s in SHIFTS):
-                    continue
-            note = ""
-            if sub_shift == "오픈" and "best_schedule" in st.session_state:
-                prev = sub_date - timedelta(days=1)
-                if prev in st.session_state["best_schedule"]:
-                    if emp["이름"] in st.session_state["best_schedule"][prev].get("마감", []):
-                        note = "⚠️ 전날 마감"
-            cw = sum(1 for d in dates if "best_schedule" in st.session_state and
-                     any(emp["이름"] in st.session_state["best_schedule"].get(d, {}).get(s, []) for s in SHIFTS))
-            cands.append({"이름": emp["이름"], "유형": emp["직원유형"],
-                          "현재 근무일수": cw, "최대 근무": emp["월최대근무횟수"],
-                          "비고": note if note else "✅ 가능"})
-        if cands:
-            st.markdown(f'<p style="color:#166534; background:#dcfce7; padding:12px 16px; border-radius:8px; font-weight:600;">{len(cands)}명의 대타 후보를 찾았습니다.</p>', unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(cands).sort_values("현재 근무일수"), use_container_width=True)
-            st.markdown('<p style="color:#334155;font-size:14px;">💡 현재 근무일수 적은 순 정렬</p>', unsafe_allow_html=True)
-            if st.button("대타 요청 DB 등록"):
-                save_sub_req(st.session_state.store_name, absent_emp, sub_date, sub_shift)
-                st.markdown('<p style="color:#166534; background:#dcfce7; padding:12px 16px; border-radius:8px; font-weight:600;">대타 요청이 등록되었습니다.</p>', unsafe_allow_html=True)
-                st.rerun()
-        else:
-            st.warning("조건에 맞는 대타 후보가 없습니다.")
-
-with tab_list:
-    reqs = load_sub_reqs(st.session_state.store_name)
-    if not reqs:
-        st.info("등록된 대타 요청이 없습니다.")
-    else:
-        for req in reqs:
-            rid, store, orig, rd, shift, status, matched, created = req
-            with st.expander(f"[{status}] {rd}  {shift}  —  {orig} 결근"):
-                c1, c2 = st.columns(2)
-                c1.write(f"**결근 직원** {orig}")
-                c2.write(f"**날짜 / 교대** {rd} / {shift}")
-                if matched: st.write(f"**매칭된 대타** {matched}")
-                if status == "대기중":
-                    cm, cd = st.columns(2)
-                    with cm:
-                        mn = st.selectbox("대타 직원", [e for e in employee_names if e != orig], key=f"m_{rid}")
-                        if st.button("매칭 확정", key=f"c_{rid}"):
-                            match_sub(rid, mn); st.markdown(f'<p style="color:#166534; background:#dcfce7; padding:12px 16px; border-radius:8px; font-weight:600;">{mn} 확정!</p>', unsafe_allow_html=True); st.rerun()
-                    with cd:
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        if st.button("삭제", key=f"d_{rid}"):
-                            delete_sub(rid); st.rerun()
